@@ -1,0 +1,107 @@
+name: Build demo_ecommerce_demo booking-service API - Generate Kong Configs
+
+on:
+  workflow_dispatch:
+  # Run if someone pushes to the feature branch (during development)
+  push:
+    branches:
+      - feat/*
+      - main
+    paths:
+      - 'demo_ecommerce_demo/booking-service/openapi.yaml'
+      - 'demo_ecommerce_demo/booking-service/kong/**'
+      - '.github/workflows/build-booking-service.yaml'
+
+jobs:
+
+  oas-to-kong:
+    name: Convert OAS to Kong configurations
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup deck
+        uses: kong/setup-deck@v1
+        with:
+          deck-version: '1.40.3'
+          wrapper: false
+
+      - name: Generate Kong Declarative Configs from Spec
+        run: |
+          deck file openapi2kong --spec demo_ecommerce_demo/booking-service/openapi.yaml \
+          --output-file demo_ecommerce_demo/booking-service/kong/.generated/kong.yaml
+
+      - name: Add plugin configuration
+        run: |
+          deck file merge demo_ecommerce_demo/booking-service/kong/.generated/kong.yaml \
+          demo_ecommerce_demo/booking-service/kong/plugins/*.yaml \
+          --output-file demo_ecommerce_demo/booking-service/kong/.generated/kong.yaml
+
+      - name: Add consumer configuration
+        run: |
+          deck file merge demo_ecommerce_demo/booking-service/kong/.generated/kong.yaml \
+          demo_ecommerce_demo/booking-service/kong/consumers/*.yaml \
+          --output-file demo_ecommerce_demo/booking-service/kong/.generated/kong.yaml
+
+      - name: Add tags
+        run: |
+          cat demo_ecommerce_demo/booking-service/kong/.generated/kong.yaml | \
+          deck file add-tags demo_ecommerce_demo booking-service \
+          --selector "$.services[*]" \
+          --selector "$.services[*].routes[*]"  \
+          --selector "$.consumers[*]" \
+          --output-file demo_ecommerce_demo/booking-service/kong/.generated/kong.yaml
+
+      - name: Add environment Specific Patch
+        run: |
+          if [ -f "demo_ecommerce_demo/booking-service/kong/patches.yaml" ]; then
+            cat demo_ecommerce_demo/booking-service/kong/.generated/kong.yaml | \
+            deck file patch demo_ecommerce_demo/booking-service/kong/patches.yaml \
+            --output-file demo_ecommerce_demo/booking-service/kong/.generated/kong.yaml
+          else
+            echo "No patches.yaml found, skipping patch step"
+          fi
+
+      - name: Validate decK state file locally
+        run: |
+          deck file validate demo_ecommerce_demo/booking-service/kong/.generated/kong.yaml
+
+      - name: Copy to artifact directory
+        run: |
+          mkdir -p .github/artifacts/demo_ecommerce_demo/booking-service/
+          cp demo_ecommerce_demo/booking-service/kong/.generated/kong.yaml \
+             .github/artifacts/demo_ecommerce_demo/booking-service/demo_ecommerce_demo-booking-service-kong.yaml
+
+      - name: Validate connectivity to Konnect
+        run: |
+          deck gateway ping \
+          --konnect-control-plane-name ${{vars.KONNECT_INTERNAL_CP}} \
+          --konnect-token ${{ secrets.KONNECT_PAT }} \
+          --konnect-addr ${{vars.KONNECT_ADDR}}
+
+      - name: deck diff
+        id: deck-diff
+        # deck diff results in a multi-line output, which requires some
+        #  bash gymnastics to handle and pass through to the next job.
+        #  See: https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#example-of-a-multiline-string
+        run: |
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "DIFF<<$EOF" >> $GITHUB_ENV
+          deck gateway diff --select-tag demo_ecommerce_demo --select-tag booking-service \
+          .github/artifacts/demo_ecommerce_demo/booking-service/demo_ecommerce_demo-booking-service-kong.yaml \
+          --konnect-control-plane-name ${{vars.KONNECT_INTERNAL_CP}} \
+          --konnect-token ${{ secrets.KONNECT_PAT }} \
+          --konnect-addr ${{vars.KONNECT_ADDR}}>> $GITHUB_ENV
+          echo "$EOF" >> $GITHUB_ENV
+
+      #an artifact file will be committed only if it the Kong config differs from the previous one.
+      - name: Check status of any files to be committed
+        run: git status
+
+      - name: Create PR to stage changes for the Kong Gateway in production
+        uses: peter-evans/create-pull-request@v5
+        with:
+          title: "❗PRD❗: Staged changes for Kong Gateway PRD deployment - demo_ecommerce_demo booking-service"
+          labels: "PRD,kong,demo_ecommerce_demo,booking-service"
+          body: "Merging this PR will result in the following changes deployed to PRD \n\n ```\n${{env.DIFF}}\n```"
